@@ -138,7 +138,7 @@ To prevent standard API 429 quota exhaustion on long PDF documents, the extracti
 ### 1. Backend Setup
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_GITHUB_USERNAME/fact-knowledge-layer.git
+git clone https://github.com/rudransh004/fact-knowledge-layer.git
 cd fact-knowledge-layer
 
 # Synchronize virtual environment dependencies
