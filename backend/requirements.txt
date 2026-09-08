@@ -1,0 +1,5 @@
+fastapi
+pydantic-settings
+uvicorn[standard]
+pypdf
+google-genai
