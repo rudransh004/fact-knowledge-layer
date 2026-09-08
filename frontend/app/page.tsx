@@ -48,6 +48,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState("");
+  const [jobProgress, setJobProgress] = useState<{ processed: number; total: number } | null>(null);
+  const [reconciling, setReconciling] = useState(false);
 
   const loadCases = () => {
     setLoading(true);
@@ -66,15 +68,31 @@ export default function Dashboard() {
     const file = event.target.files?.[0];
     if (!file) return;
     setUploading(true);
-    setMessage(`Processing ${file.name}...`);
+    setMessage(`Queued ${file.name}...`);
+    setJobProgress({ processed: 0, total: 0 });
     const formData = new FormData();
     formData.append("file", file);
     try {
       const response = await fetch(`${API_BASE}/api/upload`, { method: "POST", body: formData });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail ?? "Upload failed");
-      setMessage(`${result.facts_extracted} facts extracted from ${result.filename}.`);
-      loadCases();
+      let finished = false;
+      while (!finished) {
+        const jobResponse = await fetch(`${API_BASE}/api/jobs/${result.job_id}`);
+        const job = await jobResponse.json();
+        if (!jobResponse.ok) throw new Error(job.detail ?? "Could not read extraction progress");
+        setJobProgress({ processed: job.processed_pages, total: job.total_pages });
+        if (job.status === "COMPLETED") {
+          setMessage(`Extraction complete for ${job.filename}. Run reconciliation when ready.`);
+          finished = true;
+        } else if (job.status === "QUOTA_EXHAUSTED") {
+          throw new Error("Gemini Free-Tier Quota Exhausted. Partial results saved. Please wait for reset or provide a paid key.");
+        } else if (job.status === "FAILED") {
+          throw new Error(job.error_message ?? "Extraction failed.");
+        } else {
+          await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        }
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -82,6 +100,25 @@ export default function Dashboard() {
       event.target.value = "";
     }
   };
+
+  const runReconciliation = async () => {
+    setReconciling(true);
+    setMessage("Reconciling committed facts...");
+    try {
+      const response = await fetch(`${API_BASE}/api/reconcile`, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail ?? "Reconciliation failed");
+      setMessage(`${result.length} persisted relationships identified.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Reconciliation failed.");
+    } finally {
+      setReconciling(false);
+    }
+  };
+
+  const progressPercent = jobProgress && jobProgress.total > 0
+    ? Math.round((jobProgress.processed / jobProgress.total) * 100)
+    : 0;
 
   const renderFact = (fact: Fact, label: string) => (
     <div className="space-y-4 p-6">
@@ -119,6 +156,27 @@ export default function Dashboard() {
         </header>
 
         {message && <div className="border-l-4 border-[#b34d2e] bg-white px-4 py-3 text-sm text-[#5d6862]">{message}</div>}
+        {jobProgress && uploading && (
+          <div className="border border-[#d8d4cb] bg-white p-4">
+            <div className="mb-2 flex justify-between text-xs font-bold uppercase tracking-wider text-[#69736d]">
+              <span>Extraction progress</span>
+              <span>{jobProgress.processed}/{jobProgress.total || "..."} pages</span>
+            </div>
+            <div className="h-2 overflow-hidden bg-[#e8e3da]">
+              <div className="h-full bg-[#b34d2e] transition-all" style={{ width: `${progressPercent}%` }} />
+            </div>
+          </div>
+        )}
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={runReconciliation}
+            disabled={reconciling || uploading}
+            className="border border-[#18221f] bg-white px-4 py-2 text-sm font-semibold text-[#18221f] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {reconciling ? "Reconciling..." : "Run Reconciliation"}
+          </button>
+        </div>
         {loading ? <div className="py-20 text-center text-[#69736d]">Loading grounded cases...</div> : (
           <div className="space-y-8">
             {cases.map((relationship) => (

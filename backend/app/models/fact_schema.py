@@ -1,6 +1,60 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+_GEMINI_SCHEMA_KEYS = {
+    "type",
+    "format",
+    "title",
+    "description",
+    "nullable",
+    "enum",
+    "maxItems",
+    "minItems",
+    "properties",
+    "required",
+    "minProperties",
+    "maxProperties",
+    "items",
+    "propertyOrdering",
+}
+
+
+def gemini_response_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """Convert Pydantic JSON Schema to the subset accepted by Gemini."""
+    raw_schema = model.model_json_schema()
+    definitions = raw_schema.get("$defs", {})
+
+    def convert(node: Any) -> Any:
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        reference = node.get("$ref")
+        if reference:
+            definition_name = reference.rsplit("/", 1)[-1]
+            return convert(definitions[definition_name])
+
+        nullable = False
+        variants = node.get("anyOf")
+        if variants:
+            non_null_variants = [variant for variant in variants if variant.get("type") != "null"]
+            if len(non_null_variants) == 1 and len(non_null_variants) != len(variants):
+                node = {**non_null_variants[0], "nullable": True}
+                nullable = True
+
+        converted = {
+            key: convert(value)
+            for key, value in node.items()
+            if key in _GEMINI_SCHEMA_KEYS and key != "nullable"
+        }
+        if nullable or node.get("nullable"):
+            converted["nullable"] = True
+        return converted
+
+    return convert(raw_schema)
 
 class Provenance(BaseModel):
     model_config = ConfigDict(extra="forbid")

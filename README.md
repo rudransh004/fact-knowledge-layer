@@ -25,18 +25,20 @@ Open `http://localhost:3000`. The dashboard loads four grounded demo cases immed
 ## API
 
 - `GET /api/demo-cases`: four evaluator-facing, evidence-grounded examples.
-- `POST /api/upload`: accepts a PDF, extracts page-aware facts, and updates the in-memory knowledge layer.
+- `POST /api/upload`: validates and persists a PDF as a queued extraction job, then immediately returns a `job_id`.
+- `GET /api/jobs/{job_id}`: reports queued, processing, completed, quota-exhausted, or failed progress.
 - `POST /api/reconcile`: compares candidate facts across documents.
-- `GET /api/facts` and `GET /api/relationships`: inspect the current session state.
+- `GET /api/facts` and `GET /api/relationships`: inspect SQLite-backed facts and relationships.
 
 ## Approach
 
-1. PyMuPDF extracts text page by page and preserves one-based page numbers.
-2. Gemini 2.5 Flash receives one page at a time with a strict Pydantic response schema. Every fact requires a document name, page, and verbatim quote. Missing units or temporal scopes remain null and are recorded as ambiguity notes instead of being guessed.
-3. Page extraction runs through bounded `asyncio.to_thread` workers so blocking SDK calls do not stall FastAPI's event loop.
-4. Reconciliation first applies deterministic entity/attribute/unit similarity filtering. Only plausible cross-document candidates are sent to Gemini, reducing irrelevant comparisons and token cost.
-5. The relationship output uses four explicit buckets: `CORROBORATION`, `GENUINE_CONTRADICTION`, `RECONCILED_CONTRADICTION`, and `REASONING_FAILURE_CASE`. Explanations are concise, evidence-based rationales, not hidden chain-of-thought.
-6. The frontend keeps both facts, their exact quotes, source documents, and page numbers visible in a side-by-side comparison.
+1. SQLite persists `ExtractionJob`, `FactRecord`, and `RelationshipRecord` data in `fact_knowledge_layer.db`, requiring no external database service.
+2. PyMuPDF extracts the complete PDF with one-based page numbers. The worker groups contiguous pages into batches of 10.
+3. The async Google GenAI client makes one structured extraction request per batch. Tenacity retries transient 503 errors; a 429 quota error stops the job as `QUOTA_EXHAUSTED` without discarding prior batches.
+4. Every committed fact requires a document name, page, and verbatim quote. Missing units or temporal scopes remain null and are recorded as ambiguity notes instead of being guessed.
+5. The background worker commits facts after every batch and updates `processed_pages`, so a restart or quota failure preserves completed work.
+6. Reconciliation reads persisted facts, applies deterministic entity/attribute/unit filtering, and stores relationships back in SQLite.
+7. The frontend polls job progress, displays partial/quota states, and exposes reconciliation as an explicit action.
 
 ## Required Cases
 
@@ -49,7 +51,7 @@ The `/api/demo-cases` response and dashboard show:
 
 ## Limitations and Next Steps
 
-The prototype stores the current session in memory, processes up to 40 pages per upload, and requires Gemini for live extraction. A production deployment would add durable storage, job IDs and a queue, retries with backoff for rate limits, document hashing and deduplication, OCR for scanned PDFs, and human review for low-confidence or ambiguous facts. Demo cases are intentionally fixed examples; uploaded documents use the general extraction and candidate-reconciliation path.
+Live extraction requires Gemini quota. Batch size is 10 pages, so an 89-page PDF requires roughly 9 extraction requests rather than 89. The local worker runs in-process for zero-config setup; a production deployment would move jobs to a durable queue, add document hashing/deduplication, OCR for scanned PDFs, and human review for low-confidence or ambiguous facts. Demo cases are intentionally fixed examples; uploaded documents use the general extraction and candidate-reconciliation path.
 
 ## Additional Notes
 

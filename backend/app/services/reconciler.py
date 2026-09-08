@@ -3,14 +3,18 @@ import os
 from difflib import SequenceMatcher
 from google import genai
 from google.genai import types
-from backend.app.models.fact_schema import Fact, FactRelationship, ReconciliationResponse
+from backend.app.models.fact_schema import Fact, FactRelationship, ReconciliationResponse, gemini_response_schema
 
 class FactReconciler:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is missing")
-        self.client = genai.Client(api_key=api_key)
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=90_000),
+        )
 
     @staticmethod
     def _candidate_pairs(facts: list[Fact]) -> list[tuple[Fact, Fact]]:
@@ -60,11 +64,11 @@ class FactReconciler:
 
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=self.model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=ReconciliationResponse,
+                    response_schema=gemini_response_schema(ReconciliationResponse),
                     temperature=0.0
                 )
             )
@@ -72,4 +76,4 @@ class FactReconciler:
             return [FactRelationship(**item) for item in data.get("relationships", [])]
         except Exception as e:
             print(f"Reconciliation error: {e}")
-            raise RuntimeError("Gemini reconciliation failed") from e
+            raise RuntimeError(f"Gemini reconciliation failed: {e}") from e

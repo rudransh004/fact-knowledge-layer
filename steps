@@ -1,0 +1,12 @@
+uv sync
+
+uv run python -m compileall -q backend
+
+uv run uvicorn backend.app.main:app --reload
+
+in another terminal-------------------------
+Set-Location frontend
+npm install
+npm run lint
+npm run build
+npm run dev

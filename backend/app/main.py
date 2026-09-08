@@ -1,20 +1,32 @@
 import os
 import asyncio
+import uuid
 from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
+
+from backend.app.db import (
+    ExtractionJob,
+    FactRecord,
+    RelationshipRecord,
+    SessionLocal,
+    fact_record_to_pydantic,
+    init_db,
+)
 from backend.app.models.fact_schema import Fact, FactRelationship, Provenance
 from backend.app.services.pdf_parser import PDFParser
-from backend.app.services.extractor import FactExtractor
+from backend.app.services.extractor import FactExtractor, QuotaExhaustedError
 from backend.app.services.reconciler import FactReconciler
 
 # Load environment variables
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+PAGES_PER_BATCH = 10
 
 app = FastAPI(
     title="Fact Knowledge Layer API",
@@ -30,9 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory knowledge store for the session
-KNOWLEDGE_BASE: List[Fact] = []
-RELATIONSHIPS_BASE: List[FactRelationship] = []
+init_db()
 
 def get_extractor() -> FactExtractor:
     try:
@@ -50,9 +60,66 @@ def get_reconciler() -> FactReconciler:
 
 def gemini_http_exception(exc: Exception) -> HTTPException:
     message = str(exc).lower()
+    if "503" in message or "unavailable" in message or "high demand" in message:
+        return HTTPException(status_code=503, detail="Gemini is temporarily busy; retry the upload shortly.")
     if "429" in message or "rate limit" in message or "resource exhausted" in message:
         return HTTPException(status_code=429, detail="Gemini rate limit reached; retry shortly.")
     return HTTPException(status_code=502, detail="The Gemini service could not complete this operation.")
+
+
+def _set_job_status(job_id: str, status: str, error_message: str | None = None) -> None:
+    with SessionLocal() as session:
+        job = session.get(ExtractionJob, job_id)
+        if job:
+            job.status = status
+            job.error_message = error_message
+            session.commit()
+
+
+async def process_extraction_job(job_id: str) -> None:
+    with SessionLocal() as session:
+        job = session.get(ExtractionJob, job_id)
+        if not job:
+            return
+        source_pdf = job.source_pdf
+        filename = job.filename
+        job.status = "PROCESSING"
+        session.commit()
+
+    try:
+        pages = PDFParser.parse_pdf_pages(source_pdf, max_pages=None)
+        extractor = get_extractor()
+        batches = PDFParser.chunk_pages(pages, pages_per_batch=PAGES_PER_BATCH)
+        for batch in batches:
+            facts = await extractor.extract_batch(filename, batch)
+            with SessionLocal() as session:
+                for fact in facts:
+                    session.add(FactRecord(
+                        job_id=job_id,
+                        fact_id=fact.fact_id,
+                        entity=fact.entity,
+                        attribute=fact.attribute,
+                        value_raw=fact.value_raw,
+                        value_normalized=fact.value_normalized,
+                        unit=fact.unit,
+                        temporal_scope=fact.temporal_scope,
+                        context_modifiers=fact.context_modifiers,
+                        ambiguity_notes=fact.ambiguity_notes,
+                        document_name=fact.provenance.document_name,
+                        page_number=fact.provenance.page_number,
+                        exact_quote=fact.provenance.exact_quote,
+                    ))
+                job_record = session.get(ExtractionJob, job_id)
+                if job_record:
+                    job_record.processed_pages = min(
+                        job_record.processed_pages + len(batch), job_record.total_pages
+                    )
+                session.commit()
+        _set_job_status(job_id, "COMPLETED")
+    except QuotaExhaustedError as exc:
+        _set_job_status(job_id, "QUOTA_EXHAUSTED", str(exc))
+    except Exception as exc:
+        _set_job_status(job_id, "FAILED", str(exc))
 
 @app.get("/")
 def health_check():
@@ -60,16 +127,52 @@ def health_check():
 
 @app.get("/api/facts", response_model=List[Fact])
 def get_facts():
-    """Returns all extracted facts currently in the knowledge layer."""
-    return KNOWLEDGE_BASE
+    """Returns all successfully committed facts across extraction jobs."""
+    with SessionLocal() as session:
+        records = session.scalars(select(FactRecord).order_by(FactRecord.id)).all()
+        return [fact_record_to_pydantic(record) for record in records]
 
 @app.get("/api/relationships", response_model=List[FactRelationship])
 def get_relationships():
-    """Returns all identified cross-document relationships."""
-    return RELATIONSHIPS_BASE
+    """Returns persisted relationships from the latest reconciliation."""
+    with SessionLocal() as session:
+        relationship_records = session.scalars(select(RelationshipRecord)).all()
+        fact_records = session.scalars(select(FactRecord)).all()
+        fact_map = {
+            record.id: Fact.model_validate(fact_record_to_pydantic(record))
+            for record in fact_records
+        }
+        return [
+            FactRelationship(
+                relationship_id=record.relationship_id,
+                relationship_type=record.relationship_type,
+                fact_a=fact_map[record.fact_a_id],
+                fact_b=fact_map[record.fact_b_id],
+                explanation=record.explanation,
+                reconciliation_dimension=record.reconciliation_dimension,
+            )
+            for record in relationship_records
+            if record.fact_a_id in fact_map and record.fact_b_id in fact_map
+        ]
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    with SessionLocal() as session:
+        job = session.get(ExtractionJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Extraction job not found")
+        return {
+            "job_id": job.id,
+            "filename": job.filename,
+            "total_pages": job.total_pages,
+            "processed_pages": job.processed_pages,
+            "status": job.status,
+            "error_message": job.error_message,
+        }
 
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     Accepts a PDF file, extracts structured facts page-by-page, and appends them to the knowledge layer.
     """
@@ -81,45 +184,53 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="PDF exceeds the 25 MB upload limit.")
 
     try:
-        pages = PDFParser.parse_pdf_pages(contents, max_pages=40)
+        pages = PDFParser.parse_pdf_pages(contents, max_pages=None)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail="The uploaded file is not a readable PDF.") from exc
 
-    extractor = get_extractor()
-    try:
-        new_facts = await extractor.extract_pages(file.filename, pages)
-    except RuntimeError as exc:
-        raise gemini_http_exception(exc) from exc
-
-    KNOWLEDGE_BASE.extend(new_facts)
-
-    # Automatically update relationships across the whole knowledge base
-    if len(KNOWLEDGE_BASE) >= 2:
-        try:
-            rel = await asyncio.to_thread(get_reconciler().reconcile_facts, KNOWLEDGE_BASE)
-        except RuntimeError as exc:
-            raise gemini_http_exception(exc) from exc
-        global RELATIONSHIPS_BASE
-        RELATIONSHIPS_BASE = rel
-
+    job_id = str(uuid.uuid4())
+    with SessionLocal() as session:
+        session.add(ExtractionJob(
+            id=job_id,
+            filename=file.filename,
+            total_pages=len(pages),
+            source_pdf=contents,
+            status="QUEUED",
+        ))
+        session.commit()
+    background_tasks.add_task(process_extraction_job, job_id)
     return {
+        "job_id": job_id,
         "filename": file.filename,
-        "pages_processed": len(pages),
-        "facts_extracted": len(new_facts),
-        "total_facts_in_store": len(KNOWLEDGE_BASE)
+        "total_pages": len(pages),
+        "status": "QUEUED",
     }
 
 @app.post("/api/reconcile", response_model=list[FactRelationship])
 async def trigger_reconciliation():
     """Triggers reconciliation across all current facts in the store."""
-    if len(KNOWLEDGE_BASE) < 2:
+    with SessionLocal() as session:
+        records = session.scalars(select(FactRecord).order_by(FactRecord.id)).all()
+    if len(records) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 facts to perform reconciliation.")
+    facts = [Fact.model_validate(fact_record_to_pydantic(record)) for record in records]
     try:
-        results = await asyncio.to_thread(get_reconciler().reconcile_facts, KNOWLEDGE_BASE)
+        results = await asyncio.to_thread(get_reconciler().reconcile_facts, facts)
     except RuntimeError as exc:
         raise gemini_http_exception(exc) from exc
-    global RELATIONSHIPS_BASE
-    RELATIONSHIPS_BASE = results
+    with SessionLocal() as session:
+        session.query(RelationshipRecord).delete()
+        fact_ids = {record.fact_id: record.id for record in records}
+        for relationship in results:
+            session.add(RelationshipRecord(
+                relationship_id=relationship.relationship_id,
+                relationship_type=relationship.relationship_type,
+                fact_a_id=fact_ids.get(relationship.fact_a.fact_id),
+                fact_b_id=fact_ids.get(relationship.fact_b.fact_id),
+                explanation=relationship.explanation,
+                reconciliation_dimension=relationship.reconciliation_dimension,
+            ))
+        session.commit()
     return results
 
 @app.get("/api/demo-cases", response_model=List[FactRelationship])

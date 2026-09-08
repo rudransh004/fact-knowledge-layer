@@ -58,7 +58,7 @@ def test_extract_facts():
 
     print("[2/3] Calling Gemini API with Structured Output Schema...")
     response = client.models.generate_content(
-        model="gemini-3.5-flash",
+        model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
