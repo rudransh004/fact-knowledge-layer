@@ -2,4 +2,6 @@ fastapi
 pydantic-settings
 uvicorn[standard]
 pypdf
+pymupdf
+python-dotenv
 google-genai

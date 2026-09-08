@@ -1,12 +1,29 @@
-from pathlib import Path
+from typing import Any
 
-from pypdf import PdfReader
+import pymupdf
 
+class PDFParser:
+    @staticmethod
+    def parse_pdf_pages(pdf_bytes: bytes, max_pages: int = 40) -> list[dict[str, Any]]:
+        """
+        Parses bytes of a PDF and returns a list of page dicts with 1-based page numbers.
+        """
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        pages_content = []
 
-def extract_pages(pdf_path: str | Path) -> list[dict[str, int | str]]:
-    """Extract text while retaining the one-based source page number."""
-    reader = PdfReader(str(pdf_path))
-    return [
-        {"page_number": page_number, "text": page.extract_text() or ""}
-        for page_number, page in enumerate(reader.pages, start=1)
-    ]
+        total_pages = min(len(doc), max_pages)
+        for page_idx in range(total_pages):
+            page = doc.load_page(page_idx)
+            text = page.get_text()
+            if text.strip():
+                pages_content.append({
+                    "page_number": page_idx + 1,
+                    "text": text
+                })
+        doc.close()
+        return pages_content
+
+    @staticmethod
+    def parse_pdf_file(file_path: str, max_pages: int = 40) -> list[dict[str, Any]]:
+        with open(file_path, "rb") as f:
+            return PDFParser.parse_pdf_pages(f.read(), max_pages=max_pages)
