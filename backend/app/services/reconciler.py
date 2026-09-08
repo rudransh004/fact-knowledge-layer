@@ -1,20 +1,20 @@
-import json
 import os
+import time
 from difflib import SequenceMatcher
+
 from google import genai
 from google.genai import types
-from backend.app.models.fact_schema import Fact, FactRelationship, ReconciliationResponse, gemini_response_schema
+from google.genai.errors import APIError
+
+from backend.app.models.fact_schema import Fact, FactRelationship, ReconciliationResponse
 
 class FactReconciler:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is missing")
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-        self.client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=90_000),
-        )
+        self.model = "gemini-3.5-flash-lite"
+        self.client = genai.Client(api_key=api_key)
 
     @staticmethod
     def _candidate_pairs(facts: list[Fact]) -> list[tuple[Fact, Fact]]:
@@ -31,9 +31,6 @@ class FactReconciler:
         return candidates
 
     def reconcile_facts(self, facts: list[Fact]) -> list[FactRelationship]:
-        """
-        Groups facts and uses Gemini to analyze pairwise relationships across documents.
-        """
         candidate_pairs = self._candidate_pairs(facts)
         if not candidate_pairs:
             return []
@@ -43,37 +40,58 @@ class FactReconciler:
             for left, right in candidate_pairs[:40]
         ]
 
+        import json
+        schema_json = json.dumps(ReconciliationResponse.model_json_schema())
+        
         prompt = f"""
-        You are an advanced Cross-Document Fact Reconciliation Engine.
-        You are given a list of atomic facts extracted from different documents or different pages.
+You are an advanced Cross-Document Fact Reconciliation Engine.
+You are given a list of atomic facts extracted from different documents or different pages.
 
-        Analyze the facts and identify relationships between facts from DIFFERENT sources or contexts.
-        You MUST classify each candidate comparison into one of these types:
-        1. 'CORROBORATION': Facts from two documents agree on the same metric, scope, and time, even if phrased differently.
-        2. 'GENUINE_CONTRADICTION': Facts refer to the exact same entity, metric, and time period, but state irreconcilable numbers/claims.
-        3. 'RECONCILED_CONTRADICTION': Surface-level contradiction where the numbers differ, BUT can be explained by context (e.g., Standalone vs Consolidated, Restated vs Original, Gross vs Net, or different reporting dates).
-        4. 'REASONING_FAILURE_CASE': Identify an extraction or reasoning ambiguity (e.g. multi-row table footnote dependency, missing qualifier, or ambiguous date period) and explain how the system detects or corrects it.
+Analyze the facts and identify relationships between facts from DIFFERENT sources or contexts.
+You MUST classify each candidate comparison into one of these types:
+1. 'CORROBORATION': Facts from two documents agree on the same metric, scope, and time, even if phrased differently.
+2. 'GENUINE_CONTRADICTION': Facts refer to the exact same entity, metric, and time period, but state irreconcilable numbers/claims.
+3. 'RECONCILED_CONTRADICTION': Surface-level contradiction where the numbers differ, BUT can be explained by context (e.g., Standalone vs Consolidated, Restated vs Original, Gross vs Net, or different reporting dates).
+4. 'REASONING_FAILURE_CASE': Identify an extraction or reasoning ambiguity (e.g. multi-row table footnote dependency, missing qualifier, or ambiguous date period) and explain how the system detects or corrects it.
+You MUST return a JSON object with this exact schema: {schema_json}. Do not include markdown formatting or explanations outside the JSON.
 
-        Give a concise, evidence-based rationale that names the relevant values, scopes, dates, units,
-        context modifiers, and provenance. Do not provide hidden chain-of-thought; return only the final rationale.
-        Do not invent relationships outside the candidate comparisons.
+Give a concise, evidence-based rationale that names the relevant values, scopes, dates, units,
+context modifiers, and provenance. Do not provide hidden chain-of-thought; return only the final rationale.
+Do not invent relationships outside the candidate comparisons.
 
-        INPUT FACTS:
-        {json.dumps(facts_summary[:60], indent=2)}
-        """
+INPUT FACTS:
+{json.dumps(facts_summary, indent=2)}
+"""
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=gemini_response_schema(ReconciliationResponse),
-                    temperature=0.0
+        max_retries = 3
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
                 )
-            )
-            data = json.loads(response.text)
-            return [FactRelationship(**item) for item in data.get("relationships", [])]
-        except Exception as e:
-            print(f"Reconciliation error: {e}")
-            raise RuntimeError(f"Gemini reconciliation failed: {e}") from e
+                
+                if response.text:
+                    import json
+                    data = json.loads(response.text)
+                    return ReconciliationResponse.model_validate(data).relationships
+                else:
+                    return []
+                    
+            except APIError as e:
+                if e.code == 429 or e.code >= 500:
+                    if attempt <= max_retries:
+                        print(f"Gemini API limit/error during reconciliation, sleeping {10 * attempt}s...")
+                        time.sleep(10 * attempt)
+                        continue
+                raise RuntimeError(f"Gemini reconciliation failed: {e}") from e
+            except Exception as e:
+                if attempt <= max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Gemini reconciliation failed: {e}") from e

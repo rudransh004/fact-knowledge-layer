@@ -1,62 +1,23 @@
-import json
 import os
+import asyncio
 from typing import Any
 
 from google import genai
 from google.genai import types
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from google.genai.errors import APIError
 
-from backend.app.models.fact_schema import Fact, ExtractionResponse, gemini_response_schema
-
+from backend.app.models.fact_schema import Fact, ExtractionResponse
 
 class QuotaExhaustedError(RuntimeError):
     """The provider rejected the request because the project quota is exhausted."""
-
-
-class TransientGeminiError(RuntimeError):
-    """A provider outage that is safe to retry."""
-
-
-def _is_transient_error(error: BaseException) -> bool:
-    message = str(error).lower()
-    return "503" in message or "unavailable" in message
-
 
 class FactExtractor:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is missing")
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-        self.client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=90_000),
-        )
-
-    @retry(
-        retry=retry_if_exception(_is_transient_error),
-        wait=wait_exponential(multiplier=2, min=2, max=16),
-        stop=stop_after_attempt(3),
-        reraise=True,
-    )
-    async def _generate(self, prompt: str) -> Any:
-        try:
-            return await self.client.aio.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=gemini_response_schema(ExtractionResponse),
-                    temperature=0.0,
-                ),
-            )
-        except Exception as exc:
-            message = str(exc).lower()
-            if "429" in message or "resource exhausted" in message or "quota" in message:
-                raise QuotaExhaustedError(str(exc)) from exc
-            if _is_transient_error(exc):
-                raise TransientGeminiError(str(exc)) from exc
-            raise
+        self.model = "gemini-3.5-flash-lite"
+        self.client = genai.Client(api_key=api_key)
 
     async def extract_batch(
         self,
@@ -72,11 +33,15 @@ class FactExtractor:
         )
         first_page = pages[0]["page_number"]
         last_page = pages[-1]["page_number"]
+        
+        import json
+        schema_json = json.dumps(ExtractionResponse.model_json_schema())
+        
         prompt = f"""
 You are an evidence-grounded fact extraction engine.
 Extract atomic, verifiable numerical and semantic facts from this contiguous PDF page batch.
+You MUST return a JSON object with this exact schema: {schema_json}. Do not include markdown formatting or explanations outside the JSON.
 
-Return only JSON matching ExtractionResponse.
 Every fact MUST:
 1. Use an exact verbatim quote from the supplied text.
 2. Use the exact source document name '{doc_name}'.
@@ -89,23 +54,36 @@ The batch covers source pages {first_page} through {last_page}.
 DOCUMENT TEXT:
 {page_text}
 """
-
-        try:
-            response = await self._generate(prompt)
-            data = json.loads(response.text)
-            return ExtractionResponse.model_validate(data).facts
-        except QuotaExhaustedError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Gemini extraction failed for pages {first_page}-{last_page}: {exc}"
-            ) from exc
-
-    async def extract_pages(
-        self,
-        doc_name: str,
-        pages: list[dict[str, Any]],
-        max_concurrency: int = 1,
-    ) -> list[Fact]:
-        """Compatibility helper; callers should prefer extract_batch for job commits."""
-        return await self.extract_batch(doc_name, pages)
+        max_retries = 3
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                
+                if response.text:
+                    import json
+                    data = json.loads(response.text)
+                    return ExtractionResponse.model_validate(data).facts
+                else:
+                    raise ValueError("Empty response from Gemini")
+                    
+            except APIError as e:
+                # 429 indicates rate limiting. 503 indicates transient server error.
+                if e.code == 429 or e.code >= 500:
+                    if attempt <= max_retries:
+                        print(f"Gemini API limit/error (code {e.code}) for pages {first_page}-{last_page}, sleeping {10 * attempt}s...")
+                        await asyncio.sleep(10 * attempt)
+                        continue
+                raise RuntimeError(f"Gemini extraction failed for pages {first_page}-{last_page}: {e}") from e
+            except Exception as e:
+                if attempt <= max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Gemini extraction failed: {e}") from e
