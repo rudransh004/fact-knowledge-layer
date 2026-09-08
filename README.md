@@ -22,6 +22,10 @@ npm run dev
 
 Open `http://localhost:3000`. The dashboard loads four grounded demo cases immediately. Upload a PDF to `/api/upload` or use the Upload PDF control. Set `NEXT_PUBLIC_API_URL` when the API is not running at `http://127.0.0.1:8000`.
 
+## Video Demo
+
+[Link to 3-minute Video Demo](https://youtube.com/YOUR_VIDEO_DEMO_LINK_HERE) *(Replace with your 3-minute video demo link showing a PDF being processed and the four required cases)*
+
 ## API
 
 - `GET /api/demo-cases`: four evaluator-facing, evidence-grounded examples.
@@ -56,3 +60,11 @@ Live extraction requires Gemini quota. Batch size is 10 pages, so an 89-page PDF
 ## Additional Notes
 
 Credentials belong only in `.env`, which is ignored by Git. The system never asks the model to expose private chain-of-thought; it stores final, auditable rationales tied to the two cited facts.
+
+## Before You Submit Checklist
+
+- [x] The project runs from instructions and accepts new PDFs through the UI and API (`/api/upload`).
+- [x] Results contain facts, verbatim source evidence with 1-based page numbers, and cross-document relationships.
+- [x] Demonstrates all four required cases (`/api/demo-cases` and live `/api/reconcile`).
+- [ ] Documented approach in `README.md` and added a demo video of 3 minutes or less.
+
