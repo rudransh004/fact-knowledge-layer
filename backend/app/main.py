@@ -24,7 +24,7 @@ from backend.app.services.reconciler import FactReconciler
 
 # Load environment variables
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PAGES_PER_BATCH = 10
 
@@ -42,29 +42,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def cleanup_stale_jobs() -> None:
+    with SessionLocal() as session:
+        stale_jobs = session.scalars(
+            select(ExtractionJob).where(ExtractionJob.status.in_(["PROCESSING", "QUEUED"]))
+        ).all()
+        for job in stale_jobs:
+            job.status = "FAILED"
+            job.error_message = "Server restarted or was interrupted while processing job. Please re-upload document."
+        session.commit()
+
 init_db()
+cleanup_stale_jobs()
 
 def get_extractor() -> FactExtractor:
     try:
         return FactExtractor()
     except ValueError as exc:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured") from exc
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY is not configured") from exc
 
 
 def get_reconciler() -> FactReconciler:
     try:
         return FactReconciler()
     except ValueError as exc:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured") from exc
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY is not configured") from exc
 
 
-def gemini_http_exception(exc: Exception) -> HTTPException:
+def groq_http_exception(exc: Exception) -> HTTPException:
     message = str(exc).lower()
     if "503" in message or "unavailable" in message or "high demand" in message:
-        return HTTPException(status_code=503, detail="Gemini is temporarily busy; retry the upload shortly.")
+        return HTTPException(status_code=503, detail="Groq is temporarily busy; retry the upload shortly.")
     if "429" in message or "rate limit" in message or "resource exhausted" in message:
-        return HTTPException(status_code=429, detail="Gemini rate limit reached; retry shortly.")
-    return HTTPException(status_code=502, detail="The Gemini service could not complete this operation.")
+        return HTTPException(status_code=429, detail="Groq rate limit reached; retry shortly.")
+    return HTTPException(status_code=502, detail="The Groq service could not complete this operation.")
 
 
 def _set_job_status(job_id: str, status: str, error_message: str | None = None) -> None:
@@ -115,6 +126,7 @@ async def process_extraction_job(job_id: str) -> None:
                         job_record.processed_pages + len(batch), job_record.total_pages
                     )
                 session.commit()
+            await asyncio.sleep(1)
         _set_job_status(job_id, "COMPLETED")
     except QuotaExhaustedError as exc:
         _set_job_status(job_id, "QUOTA_EXHAUSTED", str(exc))
@@ -162,6 +174,7 @@ def get_job(job_id: str):
         job = session.get(ExtractionJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Extraction job not found")
+        fact_count = session.query(FactRecord).filter(FactRecord.job_id == job_id).count()
         return {
             "job_id": job.id,
             "filename": job.filename,
@@ -169,7 +182,48 @@ def get_job(job_id: str):
             "processed_pages": job.processed_pages,
             "status": job.status,
             "error_message": job.error_message,
+            "fact_count": fact_count,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
         }
+
+@app.get("/api/jobs")
+def list_jobs():
+    with SessionLocal() as session:
+        jobs = session.scalars(select(ExtractionJob).order_by(ExtractionJob.created_at.desc())).all()
+        result = []
+        for job in jobs:
+            fact_count = session.query(FactRecord).filter(FactRecord.job_id == job.id).count()
+            result.append({
+                "job_id": job.id,
+                "filename": job.filename,
+                "total_pages": job.total_pages,
+                "processed_pages": job.processed_pages,
+                "status": job.status,
+                "error_message": job.error_message,
+                "fact_count": fact_count,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+            })
+        return result
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str):
+    with SessionLocal() as session:
+        job = session.get(ExtractionJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        session.query(FactRecord).filter(FactRecord.job_id == job_id).delete()
+        session.delete(job)
+        session.commit()
+        return {"status": "success", "message": f"Job {job_id} deleted"}
+
+@app.delete("/api/facts")
+def clear_all_custom_facts():
+    with SessionLocal() as session:
+        session.query(RelationshipRecord).delete()
+        session.query(FactRecord).delete()
+        session.query(ExtractionJob).delete()
+        session.commit()
+        return {"status": "success", "message": "All custom uploaded files, facts, and relationships cleared"}
 
 @app.post("/api/upload")
 async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -217,7 +271,7 @@ async def trigger_reconciliation():
     try:
         results = await asyncio.to_thread(get_reconciler().reconcile_facts, facts)
     except RuntimeError as exc:
-        raise gemini_http_exception(exc) from exc
+        raise groq_http_exception(exc) from exc
     with SessionLocal() as session:
         session.query(RelationshipRecord).delete()
         fact_ids = {record.fact_id: record.id for record in records}
